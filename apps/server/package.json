@@ -1,0 +1,12 @@
+{
+  "name": "@easy-vless/server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file-if-exists=../../.env --watch server.js",
+    "start": "node --env-file-if-exists=../../.env server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": { "express": "^4.21.2" }
+}
