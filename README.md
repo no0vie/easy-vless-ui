@@ -1,3 +1,8 @@
+# TODO
+
+- Добавить проверку на безопасность для createScriptRunner
+- Добавить поддержку 'grpc', 'ws', 'tcp'
+
 # Easy VLESS UI
 
 An npm-workspace monorepo with a Vue 3 SPA and an Express API around `scripts/service.sh`. Two Docker images deploy the API and nginx-hosted frontend separately.
