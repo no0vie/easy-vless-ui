@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.npm-cache/
+.env
+.env.*
+!.env.example
+coverage/
+*.log
+.DS_Store
+__pycache__/
+*.pyc
+.local/

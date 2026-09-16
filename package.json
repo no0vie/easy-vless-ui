@@ -1,22 +1,17 @@
 {
-  "name": "vless-manager-web",
+  "name": "easy-vless-ui",
   "version": "1.0.0",
+  "private": true,
+  "workspaces": ["apps/server", "apps/web"],
+  "engines": { "node": ">=22.9.0" },
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "serve": "node server.js"
+    "dev": "concurrently -k -n server,web \"npm run dev:server\" \"npm run dev:web\"",
+    "dev:server": "npm run dev --workspace=@easy-vless/server",
+    "dev:web": "npm run dev --workspace=@easy-vless/web",
+    "build": "npm run build --workspace=@easy-vless/web",
+    "start": "npm run start --workspace=@easy-vless/server",
+    "test": "node --test apps/server/test/*.test.js apps/web/src/*.test.js && python3 scripts/test_service.py",
+    "test:script": "python3 scripts/test_service.py"
   },
-  "dependencies": {
-    "vue": "^3.3.4",
-    "axios": "^1.4.0",
-    "express": "^4.18.2",
-    "cors": "^2.8.5"
-  },
-  "devDependencies": {
-    "@vitejs/plugin-vue": "^4.2.3",
-    "vite": "^4.3.9",
-    "tailwindcss": "^3.3.2",
-    "autoprefixer": "^10.4.14",
-    "postcss": "^8.4.23"
-  }
+  "devDependencies": { "concurrently": "^9.1.2" }
 }

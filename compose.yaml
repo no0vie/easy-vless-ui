@@ -1,0 +1,38 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    init: true
+    restart: unless-stopped
+    environment:
+      API_TOKEN: ${API_TOKEN:?Set API_TOKEN in .env before starting Docker}
+      BASE_DIR: /data
+      VLESS_PUBLIC_HOST: ${VLESS_PUBLIC_HOST:?Set your VLESS server address in .env}
+      VLESS_PORT: ${VLESS_PORT:-443}
+      VLESS_UUID: ${VLESS_UUID:?Set the existing server UUID in .env}
+      REALITY_PUBLIC_KEY: ${REALITY_PUBLIC_KEY:?Set the server REALITY public key in .env}
+      REALITY_SHORT_ID: ${REALITY_SHORT_ID:?Set the existing server short ID in .env}
+      REALITY_SERVER_NAME: ${REALITY_SERVER_NAME:-www.cloudflare.com}
+      REALITY_FINGERPRINT: ${REALITY_FINGERPRINT:-chrome}
+      XHTTP_PATH: ${XHTTP_PATH:-/xhttp}
+      XHTTP_MODE: ${XHTTP_MODE:-auto}
+      XHTTP_HOST: ${XHTTP_HOST:-}
+    volumes:
+      - profiles:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:80"
+    depends_on:
+      server:
+        condition: service_healthy
+volumes:
+  profiles:
