@@ -38,20 +38,350 @@ VERSION="2.0"
 # BoRIS configuration (unified with previous scripts)
 # ============================================================
 
-BORI_ROOT="/opt/boris"
+BORI_ROOT="${BORIS_ROOT:-${BORI_ROOT:-/opt/boris}}"
 LAN_IP="192.168.1.200"
 
 SERVICES_ROOT="${BORI_ROOT}/services"
-BASE_DIR="${BORI_ROOT}/vless-client"
+BASE_DIR="${BASE_DIR:-${BORI_ROOT}/vless-client}"
 
 XRAY_SERVER_DIR="${SERVICES_ROOT}/xray"
-PROFILE_DIR="${BASE_DIR}/profiles"
-BACKUP_DIR="${BASE_DIR}/backups"
+PROFILE_DIR="${PROFILE_DIR:-${BASE_DIR}/profiles}"
+BACKUP_DIR="${BACKUP_DIR:-${BASE_DIR}/backups}"
 
-SECRETS_DIR="${XRAY_SERVER_DIR}/secrets"
-ENV_FILE="${BASE_DIR}/client.env"
+SECRETS_DIR="${SECRETS_DIR:-${XRAY_SERVER_DIR}/secrets}"
+ENV_FILE="${ENV_FILE:-${BASE_DIR}/client.env}"
 
-LOG="/var/log/boris-vless-client.log"
+LOG="${LOG:-/var/log/boris-vless-client.log}"
+
+# Noninteractive API (Bash + Python 3 standard library; no root/Docker/jq):
+#   service.sh --list-clients --format json
+#   service.sh --create-client --name phone --transport raw
+#   service.sh --get-client --name phone
+#   service.sh --update-client --name phone --new-name tablet --expiry 30
+#   service.sh --copy-client --name tablet --new-name laptop
+#   service.sh --delete-client --name laptop
+#   service.sh --status
+# JSON is the default/only API format. No arguments retains the interactive UI.
+# --transport: raw or xhttp (REALITY); --flow: none, '', or xtls-rprx-vision.
+# 'none' normalizes to empty flow in config, metadata responses and URI output.
+# XHTTP defaults to empty flow and rejects explicitly supplied Vision flow.
+# --expiry: nonnegative integer DAYS; 0 clears, positive days become now + DAYS
+# in UTC ISO format (24 hours/day). ISO dates/timezone-qualified datetimes remain
+# accepted for compatibility; ''/null also clears. Expiry is metadata only.
+# Identity is the filename stem, never the shared VLESS UUID. Rename changes it.
+# Copies retain credentials/config/expiry, but receive a new creation timestamp.
+# Existing files without _profile metadata expose null created/expiry. Metadata
+# lives under _profile in the existing JSON file, omitted from returned config.
+# JSON mode manages connection profiles, NOT server accounts. Expiry is metadata
+# only: no revocation, enforcement, server reload, or traffic monitoring occurs.
+# All activity/server status is unknown; unavailable telemetry/version is null.
+#
+# Paths: BORIS_ROOT (legacy BORI_ROOT fallback), BASE_DIR, PROFILE_DIR,
+# SECRETS_DIR, ENV_FILE, BACKUP_DIR, LOG override the defaults below/above.
+# API uses PROFILE_DIR (including .api.lock); BACKUP_DIR/LOG are interactive-only.
+# Creation reads literal assignments from ENV_FILE, overridden by process env:
+# VLESS_PUBLIC_HOST (required), VLESS_PORT (443), VLESS_UUID, VLESS_FLOW (Vision),
+# REALITY_PUBLIC_KEY, REALITY_SHORT_ID, REALITY_SERVER_NAME (www.cloudflare.com),
+# REALITY_FINGERPRINT (chrome), XHTTP_PATH (/xhttp), XHTTP_MODE (auto), XHTTP_HOST.
+# Missing UUID/key/short ID fall back to SECRETS_DIR/{uuid,public.key,short-id}.
+# Get/update/copy/delete need only existing profiles, not env or server secrets.
+# List/status read ENV_FILE for server address/port, falling back to profiles.
+# ENV_FILE accepts literal KEY=value (optionally export/quoted), not shell code.
+# API writes are private (0600), atomically replaced and serialized on .api.lock;
+# the interactive UI does not participate in that lock. No API backups are made.
+# Keep this before interactive logging, root checks and runtime variable resets.
+if (( $# )); then
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' '{"error":"python3 is required","code":"SCRIPT_ERROR"}'
+        exit 1
+    fi
+    export BASE_DIR PROFILE_DIR BACKUP_DIR SECRETS_DIR ENV_FILE
+    exec python3 - "$@" <<'PYAPI'
+import copy
+import datetime as dt
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import sys
+import tempfile
+import urllib.parse
+import uuid
+
+
+class APIError(Exception):
+    def __init__(self, message, code="VALIDATION_ERROR"):
+        super().__init__(message)
+        self.code = code
+
+
+def fail(message, code="VALIDATION_ERROR"):
+    raise APIError(message, code)
+
+
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", re.ASCII)
+ACTIONS = {"--" + v + "-client" for v in ("create", "get", "update", "copy", "delete")}
+ACTIONS |= {"--list-clients", "--status"}
+OPTIONS = {"--name", "--new-name", "--transport", "--flow", "--expiry", "--format"}
+KEYS = set("VLESS_PUBLIC_HOST VLESS_PORT VLESS_UUID VLESS_FLOW REALITY_PUBLIC_KEY REALITY_SHORT_ID REALITY_SERVER_NAME REALITY_FINGERPRINT XHTTP_PATH XHTTP_MODE XHTTP_HOST".split())
+profiles = Path(os.environ["PROFILE_DIR"])
+
+
+def arguments():
+    args, opts, action = iter(sys.argv[1:]), {}, None
+    for arg in args:
+        if arg in ACTIONS:
+            if action:
+                fail("Exactly one action is required")
+            action = arg
+        elif arg in OPTIONS:
+            if arg in opts:
+                fail("Duplicate option: " + arg)
+            value = next(args, None)
+            if value is None or value.startswith("--"):
+                fail("Missing value for " + arg)
+            opts[arg] = value
+        else:
+            fail("Unknown argument: " + arg)
+    if not action:
+        fail("An action is required")
+    if opts.get("--format", "json") != "json":
+        fail("Only --format json is supported")
+    allowed = {"--format"}
+    if action not in {"--list-clients", "--status"}:
+        allowed.add("--name")
+        if "--name" not in opts:
+            fail("--name is required")
+    if action in {"--create-client", "--update-client", "--copy-client"}:
+        allowed |= {"--transport", "--flow", "--expiry"}
+    if action in {"--update-client", "--copy-client"}:
+        allowed.add("--new-name")
+    if action == "--copy-client" and "--new-name" not in opts:
+        fail("--new-name is required for copy")
+    if opts.keys() - allowed:
+        fail("Options not applicable to action: " + ", ".join(sorted(opts.keys() - allowed)))
+    for key in ("--name", "--new-name"):
+        if key in opts and not NAME.fullmatch(opts[key]):
+            fail(key + " must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    if "--transport" in opts and opts["--transport"] not in {"raw", "xhttp"}:
+        fail("Supported transports: raw, xhttp")
+    if opts.get("--flow") == "none":
+        opts["--flow"] = ""
+    if "--flow" in opts and opts["--flow"] not in {"", "xtls-rprx-vision"}:
+        fail("Flow must be none, empty or xtls-rprx-vision")
+    if "--expiry" in opts:
+        value = opts["--expiry"]
+        if value in {"", "null"}:
+            opts["--expiry"] = None
+        elif re.fullmatch(r"[0-9]+", value):
+            try:
+                days = int(value)
+                opts["--expiry"] = (
+                    (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=days))
+                    .isoformat().replace("+00:00", "Z") if days else None
+                )
+            except (ValueError, OverflowError):
+                fail("Expiry days exceed the supported datetime range")
+        else:
+            try:
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                    dt.date.fromisoformat(value)
+                else:
+                    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        raise ValueError()
+            except ValueError:
+                fail("Expiry must be nonnegative integer days, an ISO date or timezone-qualified datetime, or null")
+    return action, opts
+
+
+def environment():
+    # Literal assignments only; never source/eval user-writable shell content.
+    values = {}
+    path = Path(os.environ["ENV_FILE"])
+    if path.exists():
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            match = re.fullmatch(r"\s*(?:export\s+)?([A-Z_]+)=(.*)", line)
+            if not match or match[1] not in KEYS:
+                fail("Unsupported environment assignment at line " + str(number))
+            try:
+                parts = shlex.split(match[2], comments=True)
+            except ValueError:
+                fail("Invalid environment quoting at line " + str(number))
+            if len(parts) > 1:
+                fail("Expected a literal environment value at line " + str(number))
+            values[match[1]] = parts[0] if parts else ""
+    values.update({k: os.environ[k] for k in KEYS if k in os.environ})
+    return values
+
+
+def path_for(name):
+    path = profiles / (name + ".json")
+    if path.is_symlink():
+        fail("Symlink profiles are not supported", "SCRIPT_ERROR")
+    return path
+
+
+def load(name):
+    path = path_for(name)
+    if not path.exists():
+        fail("Profile not found: " + name, "NOT_FOUND")
+    with path.open() as stream:
+        data = json.load(stream)
+    client(name, data)  # Validate existing profiles before any mutation.
+    return data
+
+
+def client(name, data):
+    s, u = data["streamSettings"], data["users"][0]
+    r = s["realitySettings"]
+    if s["network"] not in {"raw", "xhttp"} or s["security"] != "reality":
+        fail("Unsupported stored profile: " + name, "SCRIPT_ERROR")
+    params = {"encryption": u.get("encryption", "none"), "flow": u.get("flow", ""),
+              "security": "reality", "sni": r["serverName"], "fp": r.get("fingerprint", "chrome"),
+              "pbk": r["publicKey"], "sid": r["shortId"], "spx": r.get("spiderX", "/"),
+              "type": s["network"]}
+    if s["network"] == "xhttp":
+        x = s.get("xhttpSettings", {})
+        params.update(path=x.get("path", "/"), mode=x.get("mode", ""), host=x.get("host", ""))
+    address = data["address"]
+    authority = "[" + address + "]" if ":" in address and not address.startswith("[") else address
+    uri = "vless://{}@{}:{}?{}#{}".format(u["id"], authority, data["port"],
+        urllib.parse.urlencode({k: v for k, v in params.items() if v != ""}), urllib.parse.quote(name))
+    metadata = data.get("_profile", {})
+    config = {k: v for k, v in data.items() if k != "_profile"}
+    return dict(id=name, name=name, transport=s["network"], flow=u.get("flow", ""),
+                created=metadata.get("created"), expiry=metadata.get("expiry"), status="unknown",
+                address=address, port=data["port"], config=config, connectionString=uri)
+
+
+def new_profile(env):
+    values = dict(env)
+    for key, filename in (("VLESS_UUID", "uuid"), ("REALITY_PUBLIC_KEY", "public.key"), ("REALITY_SHORT_ID", "short-id")):
+        if not values.get(key):
+            path = Path(os.environ["SECRETS_DIR"]) / filename
+            if path.is_file():
+                values[key] = path.read_text().strip()
+        if not values.get(key):
+            fail("Missing " + key + " (environment or server secrets)")
+    host = values.get("VLESS_PUBLIC_HOST", "")
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", host):
+        fail("A valid VLESS_PUBLIC_HOST is required")
+    try:
+        port = int(values.get("VLESS_PORT", "443"))
+        if not 1 <= port <= 65535:
+            raise ValueError()
+        uuid.UUID(values["VLESS_UUID"])
+    except ValueError:
+        fail("Invalid VLESS_PORT or VLESS_UUID")
+    sid = values["REALITY_SHORT_ID"]
+    if not re.fullmatch(r"(?:[a-fA-F0-9]{2}){1,8}", sid):
+        fail("Invalid REALITY_SHORT_ID")
+    return {"address": host, "port": port,
+            "users": [{"id": values["VLESS_UUID"], "encryption": "none", "flow": values.get("VLESS_FLOW", "xtls-rprx-vision")}],
+            "streamSettings": {"network": "raw", "security": "reality", "realitySettings": {
+                "fingerprint": values.get("REALITY_FINGERPRINT", "chrome"),
+                "serverName": values.get("REALITY_SERVER_NAME", "www.cloudflare.com"),
+                "publicKey": values["REALITY_PUBLIC_KEY"], "shortId": sid, "spiderX": "/"}}}
+
+
+def persist(path, data):
+    fd, tmp = tempfile.mkstemp(prefix=".profile-", dir=str(profiles))
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(data, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def run(action, opts):
+    if action in {"--list-clients", "--status"}:
+        items = [client(p.stem, load(p.stem)) for p in sorted(profiles.glob("*.json")) if NAME.fullmatch(p.stem)]
+        env = environment()
+        address = env.get("VLESS_PUBLIC_HOST") or (items[0]["address"] if items else None)
+        port = int(env["VLESS_PORT"]) if env.get("VLESS_PORT") else (items[0]["port"] if items else None)
+        if action == "--status":
+            return {"server": {"status": "unknown", "address": address, "port": port, "uptime": None},
+                    "clients": {"total": len(items), "active": None}, "traffic": {"today": None, "total": None}}
+        summaries = [{k: v for k, v in item.items() if k not in {"config", "connectionString"}} for item in items]
+        return {"clients": summaries, "total": len(items), "serverInfo": {"address": address, "port": port, "version": None}}
+    name = opts["--name"]
+    source = path_for(name)
+    if action == "--create-client":
+        if source.exists():
+            fail("Profile already exists: " + name, "CONFLICT")
+        env = environment()
+        data = new_profile(env)
+    else:
+        data = load(name)
+        if action == "--get-client":
+            return client(name, data)
+        if action == "--delete-client":
+            source.unlink()
+            return {"success": True}
+        env = {}  # Updates/copies do not depend on current server secrets/env.
+    target_name = opts.get("--new-name", name)
+    target = path_for(target_name)
+    if (target != source or action == "--copy-client") and target.exists():
+        fail("Profile already exists: " + target_name, "CONFLICT")
+    data = copy.deepcopy(data)
+    s = data["streamSettings"]
+    s["network"] = opts.get("--transport", s["network"])
+    if s["network"] == "xhttp":
+        s.setdefault("xhttpSettings", {"path": env.get("XHTTP_PATH", "/xhttp"), "mode": env.get("XHTTP_MODE", "auto")})
+        if env.get("XHTTP_HOST"):
+            s["xhttpSettings"]["host"] = env["XHTTP_HOST"]
+    else:
+        s.pop("xhttpSettings", None)
+    user = data["users"][0]
+    if "--flow" in opts:
+        user["flow"] = opts["--flow"]
+    elif s["network"] == "xhttp":
+        user["flow"] = ""
+    if user.get("flow", "") not in {"", "xtls-rprx-vision"}:
+        fail("Flow must be empty or xtls-rprx-vision")
+    if s["network"] == "xhttp" and user.get("flow"):
+        fail("XHTTP requires empty flow")
+    metadata = data.setdefault("_profile", {})
+    if action in {"--create-client", "--copy-client"}:
+        metadata["created"] = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    if "--expiry" in opts:
+        metadata["expiry"] = opts["--expiry"]
+    result = client(target_name, data)
+    persist(target, data)
+    if action == "--update-client" and target != source:
+        source.unlink()
+    return {"success": True, "client": result}
+
+
+try:
+    action, opts = arguments()
+    os.umask(0o077)
+    profiles.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Serialize API writers/readers across processes; atomic replaces keep readers
+    # of the original interactive format from seeing partially written JSON.
+    lock_fd = os.open(str(profiles / ".api.lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock_fd, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        result = run(action, opts)
+    print(json.dumps(result))
+except APIError as exc:
+    print(json.dumps({"error": str(exc), "code": exc.code}))
+    sys.exit(1)
+except Exception as exc:
+    print(json.dumps({"error": "Profile operation failed: " + str(exc), "code": "SCRIPT_ERROR"}))
+    sys.exit(1)
+PYAPI
+fi
 
 # ============================================================
 # Xray configuration
